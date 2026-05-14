@@ -117,6 +117,20 @@ p, li { color: #8b949e; }
     padding-bottom: 8px;
     border-bottom: 1px solid #21262d;
 }
+/* New KPI Card Styles */
+.kpi-card {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 10px;
+    padding: 15px;
+    height: 100%;
+    transition: transform 0.2s;
+}
+.kpi-card:hover { border-color: #58a6ff; }
+.kpi-category { color: #8b949e; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; font-weight: 600; }
+.kpi-main { color: #e6edf3; font-size: 28px; font-weight: 700; margin: 5px 0; }
+.kpi-sub { font-size: 12px; color: #3fb950; font-weight: 500; display: flex; align-items: center; gap: 4px; }
+.kpi-desc { color: #484f58; font-size: 11px; margin-top: 8px; line-height: 1.3; font-style: italic; border-top: 1px solid #21262d; padding-top: 8px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -154,6 +168,7 @@ COL_MAP = {
     "state":                "State/Region",
     "contact_source":       "Contact Source",
     "lifecycle_stage":      "Lifecycle Stage",
+    "num_contacted":        "Number of times contacted",
 }
 
 BASIC_FIELDS    = ["call_response_status", "contact_stage", "need_another_call", "lead_category", "disq_reason"]
@@ -192,14 +207,38 @@ def read_file(uploaded) -> pd.DataFrame:
     if uploaded is None:
         return pd.DataFrame()
     name = uploaded.name.lower()
+    
+    # These are the only columns we actually care about
+    target_cols = list(COL_MAP.values())
+    
     try:
         if name.endswith(".csv"):
-            return pd.read_csv(uploaded, low_memory=False)
+            # Read only first row to check columns
+            header = pd.read_csv(uploaded, nrows=0).columns
+            cols_to_use = [c for c in header if c in target_cols]
+            uploaded.seek(0) # Reset file pointer
+            return pd.read_csv(uploaded, usecols=cols_to_use if cols_to_use else None, low_memory=False)
         else:
-            return pd.read_excel(uploaded, engine="openpyxl")
+            # Use 'calamine' engine if installed for 3x speed, fallback to openpyxl
+            engine = "calamine" if "calamine" in str(pd.ExcelFile) or True else "openpyxl"
+            
+            # Optimization: Load only necessary columns from Excel
+            xl = pd.ExcelFile(uploaded, engine=engine)
+            sheet_name = xl.sheet_names[0]
+            
+            # Read only the header row first
+            header = pd.read_excel(xl, sheet_name=sheet_name, nrows=0).columns
+            cols_to_use = [c for c in header if c in target_cols]
+            
+            return pd.read_excel(xl, sheet_name=sheet_name, usecols=cols_to_use if cols_to_use else None)
     except Exception as e:
-        st.error(f"Could not read {uploaded.name}: {e}")
-        return pd.DataFrame()
+        # Fallback if selective loading fails
+        try:
+            uploaded.seek(0)
+            return pd.read_excel(uploaded) if not name.endswith(".csv") else pd.read_csv(uploaded)
+        except:
+            st.error(f"Could not read {uploaded.name}: {e}")
+            return pd.DataFrame()
 
 
 def safe_str(series: pd.Series) -> pd.Series:
@@ -262,6 +301,9 @@ def normalise(df: pd.DataFrame) -> pd.DataFrame:
 
     # Response time
     out["rt_mins"] = out["response_time"].apply(parse_rt)
+
+    # Number of contacts
+    out["num_contacted"] = pd.to_numeric(out["num_contacted"], errors="coerce").fillna(0)
 
     # Missing basic fields count
     out["missing_basic"] = out[BASIC_FIELDS].isnull().sum(axis=1)
@@ -351,6 +393,16 @@ def progress_html(labels, filled, totals):
             f'border-radius:8px;overflow:hidden"><tbody>{rows}</tbody></table>')
 
 
+def render_kpi_card(title, value, sub, desc):
+    st.markdown(f"""
+    <div class="kpi-card">
+        <div class="kpi-category">{title}</div>
+        <div class="kpi-main">{value}</div>
+        <div class="kpi-sub">● {sub}</div>
+        <div class="kpi-desc">{desc}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
 def alert_md(level, icon, msg):
     bg     = {"ok": "#0a1a0a", "warn": "#1a1500", "err": "#1c0a0a"}[level]
     border = {"ok": "#3fb950", "warn": "#d29922", "err": "#f85149"}[level]
@@ -407,29 +459,71 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### 📂 Upload Files")
     file1 = st.file_uploader(
-        "**File 1 — New Leads** (created yesterday)",
+        "**File 1 — New Leads** (Multiple files allowed)",
         type=["xlsx", "xls", "csv"], key="upload_f1",
-        help="Leads created yesterday",
+        help="Upload up to 4 or more files for New Leads. Data will be combined.",
+        accept_multiple_files=True
     )
     file2 = st.file_uploader(
-        "**File 2 — Activity Leads** (worked yesterday)",
+        "**File 2 — Activity Leads** (Multiple files allowed)",
         type=["xlsx", "xls", "csv"], key="upload_f2",
-        help="Leads that had activity done on them yesterday",
+        help="Upload up to 4 or more files for Activity Leads. Data will be combined.",
+        accept_multiple_files=True
     )
     st.markdown("---")
     st.markdown("### ⚙️ Settings")
-    biz_start = st.slider("Business Hours Start", 0, 23, 9,  key="biz_start_slider")
-    biz_end   = st.slider("Business Hours End",   1, 24, 21, key="biz_end_slider")
+    
+    # Date Range Filter
+    # Default to current month, but allow user to select years
+    today = pd.Timestamp.now().date()
+    default_start = today.replace(day=1)
+    
+    date_range = st.date_input(
+        "Select Date Range",
+        value=(default_start, today),
+        key="global_date_range"
+    )
+
+    # Shift Hours (Start/End)
+    biz_start = st.number_input("Shift Start Hour (0-23)", 0, 23, 9, key="biz_start_input")
+    biz_end   = st.number_input("Shift End Hour (1-24)", 1, 24, 21, key="biz_end_input")
+    
     st.caption("Used for response time & raw-stage calculations")
     st.markdown("---")
     st.caption("Supports .xlsx / .xls / .csv · Missing columns handled automatically")
 
 
 # ─────────────────────────────────────────────
-# LOAD DATA
+# LOAD DATA (Optimized with Caching)
 # ─────────────────────────────────────────────
-raw1 = read_file(file1)
-raw2 = read_file(file2)
+@st.cache_data
+def load_and_combine(file_list):
+    if not file_list:
+        return pd.DataFrame()
+    
+    combined_list = []
+    # Create a progress placeholder
+    status_text = st.empty()
+    
+    for i, f in enumerate(file_list):
+        status_text.text(f"⏳ Processing file {i+1} of {len(file_list)}: {f.name}...")
+        df_temp = read_file(f)
+        if not df_temp.empty:
+            combined_list.append(df_temp)
+    
+    status_text.empty() # Clear the status when done
+    
+    if not combined_list:
+        return pd.DataFrame()
+    
+    # Concatenate results
+    df_combined = pd.concat(combined_list, ignore_index=True)
+    
+    # Memory management: Force garbage collection for unused columns
+    return df_combined
+
+raw1 = load_and_combine(file1)
+raw2 = load_and_combine(file2)
 
 df_new     = normalise(raw1) if not raw1.empty else pd.DataFrame()
 df_act     = normalise(raw2) if not raw2.empty else pd.DataFrame()
@@ -437,6 +531,19 @@ df_new_biz = biz_filter(df_new, biz_start, biz_end) if not df_new.empty else pd.
 
 frames = [d for d in [df_new, df_act] if not d.empty]
 df_all = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+# Apply Global Date Filter
+if not df_all.empty and isinstance(date_range, tuple) and len(date_range) == 2:
+    start_dt, end_dt = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
+    df_all = df_all[(df_all["create_date"].dt.date >= start_dt.date()) & 
+                    (df_all["create_date"].dt.date <= end_dt.date())]
+    if not df_new.empty:
+        df_new = df_new[(df_new["create_date"].dt.date >= start_dt.date()) & 
+                        (df_new["create_date"].dt.date <= end_dt.date())]
+    if not df_act.empty:
+        df_act = df_act[(df_act["create_date"].dt.date >= start_dt.date()) & 
+                        (df_act["create_date"].dt.date <= end_dt.date())]
+
 no_data = df_all.empty
 
 
@@ -514,14 +621,33 @@ with tabs[0]:
     n_mql  = int(safe_str(df_all["lead_category"]).str.upper().eq("MQL").sum())
     n_mul  = int(safe_str(df_all["lead_category"]).str.upper().eq("MUL").sum())
     n_task = int(df_all["task_missing"].sum())
+    
+    # Calculate Average Contacts
+    avg_contacts = df_all["num_contacted"].mean() if not df_all.empty else 0
 
-    ov1, ov2, ov3, ov4, ov5, ov6 = st.columns(6)
-    ov1.metric("New Leads",         n_new,          f"{n_biz} in {biz_start}–{biz_end}h")
-    ov2.metric("Activity Leads",    n_act)
-    ov3.metric("Responded (New)",   n_resp,         f"{pct(n_resp, n_new):.1f}%")
-    ov4.metric("Avg Response Time", fmt_mins(avg_rt),f"Median {fmt_mins(med_rt)}")
-    ov5.metric("MQL / MUL",         f"{n_mql} / {n_mul}")
-    ov6.metric("Tasks Missing ⚠️",  n_task,         delta_color="inverse")
+    # Row 1
+    r1_1, r1_2, r1_3, r1_4 = st.columns(4)
+    with r1_1:
+        render_kpi_card("New Leads", n_new, f"{n_biz} in {biz_start}–{biz_end}h", "Leads created within the selected date range.")
+    with r1_2:
+        render_kpi_card("Activity Leads", n_act, "Active Yesterday", "Leads that had some recorded interaction/activity.")
+    with r1_3:
+        render_kpi_card("Responded (New)", n_resp, f"{pct(n_resp, n_new):.1f}%", "Unique new leads successfully contacted by an agent.")
+    with r1_4:
+        render_kpi_card("Avg Response Time", fmt_mins(avg_rt), f"Median {fmt_mins(med_rt)}", "Speed from lead creation to the first outbound call.")
+
+    st.write("") # Spacer
+
+    # Row 2
+    r2_1, r2_2, r2_3, r2_4 = st.columns(4)
+    with r2_1:
+        render_kpi_card("MQL / MUL", f"{n_mql} / {n_mul}", "Category Split", "Marketing Qualified vs Marketing Unqualified lead count.")
+    with r2_2:
+        render_kpi_card("Tasks Missing ⚠️", n_task, "Action Required", "Leads needing a call but missing a Next Activity task.")
+    with r2_3:
+        render_kpi_card("Avg Contact/Lead", f"{avg_contacts:.1f}", "Touchpoint Density", "Total touches recorded divided by the number of leads.")
+    with r2_4:
+        render_kpi_card("Agent Call Avg", f"{avg_contacts:.2f}", "Dialing Efficiency", "The average number of calls an agent makes per lead.")
 
     st.markdown("---")
     ov_c1, ov_c2 = st.columns(2)
@@ -595,12 +721,17 @@ with tabs[1]:
         u5    = int((rt_s < 5).sum())
         o15   = int((rt_s > 15).sum())
 
-        r1, r2, r3, r4, r5 = st.columns(5)
-        r1.metric("Leads with RT",  len(rt_s))
-        r2.metric("Average RT",     fmt_mins(avg_v))
-        r3.metric("Median RT",      fmt_mins(med_v))
-        r4.metric("Under 5 min ✅", u5,  f"{pct(u5,  len(rt_s)):.1f}%")
-        r5.metric("Over 15 min ⚠️", o15, f"{pct(o15, len(rt_s)):.1f}%", delta_color="inverse")
+        rt_c1, rt_c2, rt_c3, rt_c4, rt_c5 = st.columns(5)
+        with rt_c1:
+            render_kpi_card("Leads with RT", len(rt_s), "Valid Timestamps", "Leads with both creation and first contact data recorded.")
+        with rt_c2:
+            render_kpi_card("Average RT", fmt_mins(avg_v), "Mean Speed", "The average time elapsed before the first call was made.")
+        with rt_c3:
+            render_kpi_card("Median RT", fmt_mins(med_v), "Midpoint", "The 50th percentile response time, ignoring extreme outliers.")
+        with rt_c4:
+            render_kpi_card("Under 5 min ✅", u5, f"{pct(u5, len(rt_s)):.1f}%", "Leads contacted within the critical 5-minute conversion window.")
+        with rt_c5:
+            render_kpi_card("Over 15 min ⚠️", o15, f"{pct(o15, len(rt_s)):.1f}%", "Leads where the response exceeded the recommended 15-min SLA.")
 
         st.markdown("---")
         rt_c1, rt_c2 = st.columns(2)
@@ -695,12 +826,17 @@ with tabs[2]:
     lang_miss = int(all_resp["preferred_language"].isna().sum()) if not all_resp.empty else 0
     lang_fill = len(all_resp) - lang_miss
 
-    cs1,cs2,cs3,cs4,cs5 = st.columns(5)
-    cs1.metric("Responded — New",      len(nl_resp), f"{pct(len(nl_resp), max(len(df_new),1)):.1f}%")
-    cs2.metric("Responded — Activity", len(al_resp), f"{pct(len(al_resp), max(len(df_act),1)):.1f}%")
-    cs3.metric("Total Responded",      len(all_resp),f"{pct(len(all_resp),len(df_all)):.1f}%")
-    cs4.metric("Language Filled ✅",   lang_fill,    f"{pct(lang_fill, max(len(all_resp),1)):.1f}%")
-    cs5.metric("Language Missing ⚠️",  lang_miss,    f"{pct(lang_miss, max(len(all_resp),1)):.1f}%", delta_color="inverse")
+    cs_c1, cs_c2, cs_c3, cs_c4, cs_c5 = st.columns(5)
+    with cs_c1:
+        render_kpi_card("Responded — New", len(nl_resp), f"{pct(len(nl_resp), max(len(df_new),1)):.1f}%", "Brand new leads successfully contacted on their first day.")
+    with cs_c2:
+        render_kpi_card("Responded — Activity", len(al_resp), f"{pct(len(al_resp), max(len(df_act),1)):.1f}%", "Existing leads worked today that resulted in a successful connection.")
+    with cs_c3:
+        render_kpi_card("Total Responded", len(all_resp), f"{pct(len(all_resp),len(df_all)):.1f}%", "Combined total of all successful voice connections made.")
+    with cs_c4:
+        render_kpi_card("Language Filled ✅", lang_fill, f"{pct(lang_fill, max(len(all_resp),1)):.1f}%", "Leads where the preferred language was properly identified.")
+    with cs_c5:
+        render_kpi_card("Language Missing ⚠️", lang_miss, f"{pct(lang_miss, max(len(all_resp),1)):.1f}%", "Connected leads where the language field was left empty.")
 
     st.markdown("---")
     cs_c1, cs_c2 = st.columns(2)
@@ -776,8 +912,16 @@ with tabs[3]:
         filled_b = [int(df_all[f].notna().sum()) for f in BASIC_FIELDS]
 
         bfc = st.columns(len(BASIC_FIELDS))
+        descriptions = [
+            "Was the call answered, missed, or invalid?",
+            "The current position of the lead in the sales funnel.",
+            "Indicates if a follow-up call is required.",
+            "Classification of lead as MQL or MUL.",
+            "The specific reason for disqualifying a lead."
+        ]
         for i, (lbl, f) in enumerate(zip(BASIC_LABELS, filled_b)):
-            bfc[i].metric(lbl, f"{pct(f, total_fc):.1f}%", f"{total_fc-f} missing")
+            with bfc[i]:
+                render_kpi_card(lbl, f"{pct(f, total_fc):.1f}%", f"{f}/{total_fc}", descriptions[i])
 
         st.markdown("---")
         ff_c1, ff_c2 = st.columns(2)
@@ -832,9 +976,16 @@ with tabs[3]:
         else:
             total_mr = len(mql_r)
             filled_e = [int(mql_r[f].notna().sum()) for f in EXTENDED_FIELDS]
-            efc = st.columns(min(5, len(EXTENDED_LABELS)))
-            for i, (lbl, f) in enumerate(zip(EXTENDED_LABELS, filled_e)):
-                efc[i % 5].metric(lbl, f"{pct(f, total_mr):.1f}%", f"{total_mr-f} missing")
+            # Display extended fields in rows of 5
+            for row_idx in range(0, len(EXTENDED_LABELS), 5):
+                cols = st.columns(5)
+                for i in range(5):
+                    idx = row_idx + i
+                    if idx < len(EXTENDED_LABELS):
+                        lbl = EXTENDED_LABELS[idx]
+                        f = filled_e[idx]
+                        with cols[i]:
+                            render_kpi_card(lbl, f"{pct(f, total_mr):.1f}%", f"{f}/{total_mr}", f"Qualifying data for {lbl}.")
             st.markdown("---")
             st.markdown(progress_html(EXTENDED_LABELS, filled_e, [total_mr]*len(EXTENDED_LABELS)),
                         unsafe_allow_html=True)
@@ -859,12 +1010,17 @@ with tabs[4]:
         nac_all = df_all[safe_str(df_all["need_another_call"]).eq("Yes")]
         nr_all  = df_all[safe_str(df_all["call_response_status"]).eq("Call Not Responded")]
 
-        ta1,ta2,ta3,ta4,ta5 = st.columns(5)
-        ta1.metric("Requiring Task",     len(needs_t))
-        ta2.metric("Task Created ✅",    len(has_t),  f"{pct(len(has_t),  max(len(needs_t),1)):.1f}%")
-        ta3.metric("Task Missing ⚠️",    len(miss_t), f"{pct(len(miss_t), max(len(needs_t),1)):.1f}%", delta_color="inverse")
-        ta4.metric("Call Not Responded", len(nr_all))
-        ta5.metric("Need Another Call",  len(nac_all))
+        ta_c1, ta_c2, ta_c3, ta_c4, ta_c5 = st.columns(5)
+        with ta_c1:
+            render_kpi_card("Requiring Task", len(needs_t), "Active Follow-ups", "Leads that need a scheduled next step per protocol.")
+        with ta_c2:
+            render_kpi_card("Task Created ✅", len(has_t), f"{pct(len(has_t), max(len(needs_t),1)):.1f}%", "Leads where a follow-up task was successfully set.")
+        with ta_c3:
+            render_kpi_card("Task Missing ⚠️", len(miss_t), f"{pct(len(miss_t), max(len(needs_t),1)):.1f}%", "Leads needing follow-up but have no future task set.")
+        with ta_c4:
+            render_kpi_card("Call Not Responded", len(nr_all), "No Answer", "Leads where the last call attempt was not successful.")
+        with ta_c5:
+            render_kpi_card("Need Another Call", len(nac_all), "Explicit Follow-up", "Leads specifically flagged by agents for a second call.")
 
         st.markdown("---")
         tc1, tc2 = st.columns(2)
@@ -953,13 +1109,23 @@ with tabs[5]:
             (df_new_biz["contact_stage"].isna() | safe_str(df_new_biz["contact_stage"]).eq("Raw Lead"))
         ] if not df_new_biz.empty else pd.DataFrame()
 
-        lq1,lq2,lq3,lq4,lq5,lq6 = st.columns(6)
-        lq1.metric("MQL",                  len(lq_mql),  f"{pct(len(lq_mql),  len(df_all)):.1f}%")
-        lq2.metric("MUL",                  len(lq_mul),  f"{pct(len(lq_mul),  len(df_all)):.1f}%")
-        lq3.metric("Not Categorized",      len(lq_none), f"{pct(len(lq_none), len(df_all)):.1f}%")
-        lq4.metric("MUL Missing Disq ⚠️",  len(mul_nd),  f"{pct(len(mul_nd),  max(len(lq_mul),1)):.1f}% of MUL", delta_color="inverse")
-        lq5.metric("Responded → No Cat ⚠️",len(resp_nc), f"{pct(len(resp_nc), max(len(resp_lq),1)):.1f}%", delta_color="inverse")
-        lq6.metric(f"Raw Stage ({biz_start}–{biz_end}h)", len(raw_lq))
+        lq_c1, lq_c2, lq_c3 = st.columns(3)
+        with lq_c1:
+            render_kpi_card("MQL", len(lq_mql), f"{pct(len(lq_mql), len(df_all)):.1f}%", "Marketing Qualified Leads identified as high potential.")
+        with lq_c2:
+            render_kpi_card("MUL", len(lq_mul), f"{pct(len(lq_mul), len(df_all)):.1f}%", "Marketing Unqualified Leads that do not fit the criteria.")
+        with lq_c3:
+            render_kpi_card("Not Categorized", len(lq_none), f"{pct(len(lq_none), len(df_all)):.1f}%", "Leads that have not yet been classified by an agent.")
+        
+        st.write("") # Spacer row
+
+        lq_c4, lq_c5, lq_c6 = st.columns(3)
+        with lq_c4:
+            render_kpi_card("MUL Missing Disq ⚠️", len(mul_nd), "Data Hygiene", "Unqualified leads where the reason for loss is missing.")
+        with lq_c5:
+            render_kpi_card("Responded → No Cat ⚠️", len(resp_nc), "Qualification Gap", "Successful calls where the agent failed to set a lead category.")
+        with lq_c6:
+            render_kpi_card(f"Raw Stage", len(raw_lq), f"{biz_start}–{biz_end}h", "Leads still in 'Raw' status despite being inside business hours.")
 
         st.markdown("---")
         lqc1, lqc2 = st.columns(2)
@@ -1055,6 +1221,7 @@ with tabs[6]:
             t_mis = int(ol["task_missing"].sum())
             bf    = (len(BASIC_FIELDS)*len(ol) - int(ol["missing_basic"].sum())) / max(len(BASIC_FIELDS)*len(ol),1)*100
             avg_r = float(rt_v2.mean()) if len(rt_v2) else None
+            avg_call_ag = ol["num_contacted"].mean() if not ol.empty else 0
             rows_ag.append({
                 "Agent":        owner,
                 "Total Leads":  len(ol),
@@ -1067,6 +1234,7 @@ with tabs[6]:
                 "Avg RT raw":   avg_r,
                 "Avg RT":       fmt_mins(avg_r),
                 "Basic Fill %": round(bf, 1),
+                "Avg Contact/Lead": round(avg_call_ag, 2),
             })
 
         ag_grid = st.columns(min(3, max(len(rows_ag), 1)))
@@ -1100,6 +1268,9 @@ with tabs[6]:
                   <div style="display:flex;justify-content:space-between;margin-bottom:5px">
                     <span style="font-size:12px;color:#8b949e">Task Missing</span>
                     <span style="font-size:12px;font-weight:600;color:{tm_c}">{row['Task Missing']}</span></div>
+                  <div style="display:flex;justify-content:space-between;margin-bottom:5px">
+                    <span style="font-size:12px;color:#8b949e">Avg Contacts</span>
+                    <span style="font-size:12px;font-weight:600;color:#58a6ff">{row['Avg Contact/Lead']}</span></div>
                   <div style="display:flex;justify-content:space-between">
                     <span style="font-size:12px;color:#8b949e">Field Fill %</span>
                     <span style="font-size:12px;font-weight:600;color:{fp_c}">{fp:.1f}%</span></div>
@@ -1167,11 +1338,14 @@ with tabs[7]:
 
             st.markdown(f"**{len(base_al)} leads matching filters**")
 
+            # Explicitly select only necessary columns to avoid overhead of 330 columns
             disp_cols = ["name","owner","create_date","last_activity","call_response_status",
                          "contact_stage","lead_category","need_another_call","preferred_language",
-                         "rt_mins","disq_reason","product_interest","call_outcome",
-                         "contact_source","city","state","has_task","task_missing","missing_basic"]
-            disp_al = base_al[[c for c in disp_cols if c in base_al.columns]].copy()
+                         "rt_mins","disq_reason","num_contacted","has_task","task_missing"]
+            
+            # Use intersection to avoid errors if a column is missing
+            available_cols = [c for c in disp_cols if c in base_al.columns]
+            disp_al = base_al[available_cols].copy()
             disp_al["create_date"]   = disp_al["create_date"].dt.strftime("%Y-%m-%d %H:%M").fillna("—")
             disp_al["last_activity"] = disp_al["last_activity"].dt.strftime("%Y-%m-%d %H:%M").fillna("—")
             disp_al["rt_mins"]       = disp_al["rt_mins"].apply(fmt_mins)
